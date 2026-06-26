@@ -276,98 +276,6 @@ function fmtLocalDate(d) {
   const dy = String(d.getDate()).padStart(2, "0");
   return `${y}-${mo}-${dy}`;
 }
-
-// ── LOAD & PROCESS EXCEL ───────────────────────────────────────────────────
-function loadFile(file) {
-  // FIX PERF-2: warn before parsing very large files
-  if (file.size > 25 * 1024 * 1024) {
-    if (!confirm(`This file is ${(file.size / 1024 / 1024).toFixed(1)} MB. Large files may take a few seconds to parse. Continue?`)) return;
-  }
-
-  const statusEl = document.getElementById("fileStatus");
-  statusEl.style.display = "block";
-  statusEl.innerHTML = `<div class="status-ok">⏳ LOADING…</div><div class="status-name">Parsing ${escHtml(file.name)}</div>`;
-
-  const reader = new FileReader();
-  reader.onload = e => {
-    setTimeout(() => {
-      try {
-        const wb   = XLSX.read(new Uint8Array(e.target.result), { type: "array", cellDates: true });
-        const ws   = wb.Sheets[wb.SheetNames[0]];
-        const data = XLSX.utils.sheet_to_json(ws, { defval: "" });
-        if (!data.length) { showError("The uploaded file contains no data."); return; }
-
-        const trimmed = data.map(row => {
-          const r = {};
-          for (const [k, v] of Object.entries(row)) r[k.trim()] = v;
-          return r;
-        });
-
-        // FIX ROBUST: case-insensitive column header matching
-        const colsLower = Object.keys(trimmed[0]).map(c => c.toLowerCase());
-        const missing = REQUIRED_COLUMNS.filter(c => !colsLower.includes(c.toLowerCase()));
-        if (missing.length) { showError(`Missing columns: ${missing.join(", ")}`); return; }
-
-        let df = trimmed
-          .filter(r => { const s = String(r["Special Stock Type"]).trim().toUpperCase(); return s !== "Q" && s !== "W"; })
-          .filter(r => !isProjectStockDescription(r["Special Stock Type Description"]))
-          .filter(r => !isNonMedicalCode(r["Material"]))
-          .filter(r => !isNonMedicalGroup(r["Material Group Name"]))
-          .filter(r => !isExcludedStorageLocation(r["Storage Location"]))
-          .filter(r => String(r["Inventory Valuation Type"] || "").trim() !== "");
-
-        const numCols = [
-          "Unrestricted Stock","Stock in Quality Inspection","Blocked Stock","Stock in Transit",
-          "Value of Stock in Quality Inspection","Value of Stock in Transit","Value of Unrestricted Stock",
-        ];
-        df.forEach(row => {
-          numCols.forEach(c => { row[c] = parseFloat(row[c]) || 0; });
-          // FIX BUG-8: use timezone-safe parser
-          row._expiry = parseExpiryDate(row["Shelf Life Expiration Date"]);
-          row["Total Value"] = row["Value of Unrestricted Stock"] + row["Value of Stock in Transit"] + row["Value of Stock in Quality Inspection"];
-          row["Total Qty"]   = row["Unrestricted Stock"] + row["Stock in Transit"] + row["Stock in Quality Inspection"];
-        });
-
-        df = df.filter(r =>
-          r["Unrestricted Stock"] > 0 ||
-          r["Stock in Transit"] > 0 ||
-          r["Stock in Quality Inspection"] > 0 ||
-          r["Blocked Stock"] > 0
-        );
-
-        rawDf  = df;
-        filtDf = df;
-
-        // Apply material standardization mapping if already loaded
-        if (mappingTable.size > 0) applyMaterialMapping();
-
-        // ISL-MATCH: re-cross-match received goods against new inventory snapshot
-        // (handles the case where incoming file was uploaded before inventory)
-        recomputeIslMatch();
-
-        // FIX BUG-3: clear stale page filters from the previous file
-        resetPageFilters();
-        // FIX-STFILTER: also reset transit-section filter state on new main file load
-        // so stale PO/supplying-plant selections from the previous dataset don't persist
-        stFilterState = { purDoc: "", supPlant: "" };
-
-        // If transit file was already loaded, stamp phantom flags on the new dataset
-        if (stockTransitRaw.length) recomputePhantomTransit();
-
-        showSuccess(file.name, df.length);
-        clearError();
-        hideLanding();
-        populateAllFilters();
-        // Switch to dashboard after file load
-        renderPage(currentPage === "home" ? "dashboard" : currentPage);
-      } catch (err) {
-        showError(`Could not read Excel file: ${err.message}`);
-      }
-    }, 30);
-  };
-  reader.readAsArrayBuffer(file);
-}
-
 // ── MULTI-SELECT DROPDOWN BUILDER ─────────────────────────────────────────
 // Creates a searchable checkbox dropdown inside .ms-wrap elements.
 // wrapId = id of the .ms-wrap container
@@ -888,242 +796,6 @@ function renderDashboard() {
   const aggForDl = groupBy(df, "Plant Name", [["Total Value","Total Value"],["Total Qty","Total Qty"]]);
 
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// STOCK IN TRANSIT FILE LOADER
-// Loads the separate stock-in-transit Excel (columns: Material, Material
-// Description, Plant, Name 1, Purchasing Document, Item, Supplying Plant,
-// Special Stock, Quantity, Base Unit of Measure, …).
-// Applies the same isNonMedicalCode / isNonMedicalGroup filters as the
-// main inventory file so only medical items appear.
-// ═══════════════════════════════════════════════════════════════════════════
-function loadTransitFile(file) {
-  const statusEl = document.getElementById("transitFileStatus");
-  statusEl.style.display = "block";
-  statusEl.innerHTML = `<div class="status-ok">⏳ LOADING…</div><div class="status-name">Parsing ${escHtml(file.name)}</div>`;
-
-  const reader = new FileReader();
-  reader.onload = e => {
-    setTimeout(() => {
-      try {
-        const wb   = XLSX.read(new Uint8Array(e.target.result), { type: "array" });
-        const ws   = wb.Sheets[wb.SheetNames[0]];
-        const data = XLSX.utils.sheet_to_json(ws, { defval: "" });
-        if (!data.length) {
-          statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">✗ Empty file</div>`;
-          return;
-        }
-
-        // Trim all column headers
-        const trimmed = data.map(row => {
-          const r = {};
-          for (const [k, v] of Object.entries(row)) r[k.trim()] = v;
-          return r;
-        });
-
-        // Normalise key column names (case-insensitive lookup)
-        const colMap = {};
-        if (trimmed.length) {
-          Object.keys(trimmed[0]).forEach(k => { colMap[k.toLowerCase()] = k; });
-        }
-        const getCol = name => colMap[name.toLowerCase()] || name;
-
-        // Apply the same medical filters as the main file
-        // FIX-R8: also apply isNonMedicalGroup when the column is present
-        let df = trimmed.filter(r => {
-          const mat = String(r[getCol("Material")] ?? "").trim();
-          if (!mat || isNonMedicalCode(mat)) return false;
-          const grp = String(r[getCol("Material Group Name")] ?? "").trim();
-          if (grp && isNonMedicalGroup(grp)) return false;
-          return true;
-        });
-
-        // Normalise Purchasing Document (may come as scientific notation from Excel)
-        df = df.map(r => {
-          const raw = String(r[getCol("Purchasing Document")] ?? "").trim();
-          let purDoc = raw;
-          if (/e/i.test(raw)) purDoc = String(Math.round(Number(raw)));
-          return {
-            "_st_material":     String(r[getCol("Material")]             ?? "").trim(),
-            "_st_desc":         String(r[getCol("Material Description")] ?? "").trim(),
-            "_st_plant":        String(r[getCol("Plant")]                ?? "").trim(),
-            "_st_plantName":    String(r[getCol("Name 1")]               ?? r[getCol("Plant Name")] ?? "").trim(),
-            "_st_purDoc":       purDoc,
-            "_st_supPlant":     String(r[getCol("Supplying Plant")]      ?? "").trim(),
-            "_st_qty":          parseFloat(r[getCol("Quantity")] ?? r[getCol("Order Quantity")] ?? 0) || 0,
-            "_st_uom":          String(r[getCol("Base Unit of Measure")] ?? r[getCol("Order Unit")] ?? "").trim(),
-            "_st_item":         String(r[getCol("Item")]                 ?? "").trim(),
-            "_st_specialStock": String(r[getCol("Special Stock")]        ?? "").trim(),
-          };
-        });
-
-        // FIX-EXCL-SLOC: Remove any material from stockTransitRaw that was entirely
-        // excluded from rawDf (e.g. all its rows fell under an excluded storage location
-        // or other parse-time filter).  If the material has no presence in rawDf at all
-        // it must not appear anywhere on the site, including the transit detail section.
-        if (rawDf.length) {
-          const allowedMaterials = new Set(rawDf.map(r => String(r["Material"] || "").trim()));
-          df = df.filter(r => allowedMaterials.has(r._st_material));
-        }
-
-        stockTransitRaw = df;
-        stFilterState   = { purDoc: "", supPlant: "" };
-
-        // Recompute phantom flags now that transit detail is available
-        recomputePhantomTransit();
-
-        // Update status
-        statusEl.innerHTML = `<div class="status-ok">✓ TRANSIT FILE LOADED</div><div class="status-name">${escHtml(file.name)} (${df.length.toLocaleString()} records)</div>`;
-        document.getElementById("transitUploadBtnText").textContent = "📦 Change Transit File";
-
-        // Re-render current page so phantom exclusions take effect immediately
-        const reRender = { dashboard: renderDashboard, transit: () => { renderTransit(); renderStockTransitSection(); }, branch: renderBranch, flow: renderFlow };
-        if (reRender[currentPage]) reRender[currentPage]();
-        else if (currentPage === "transit") renderStockTransitSection();
-      } catch (err) {
-        statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">✗ ${escHtml(err.message)}</div>`;
-      }
-    }, 30);
-  };
-  reader.readAsArrayBuffer(file);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// MATERIAL STANDARDIZATION MAPPING — File Loader & Core Logic
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * loadMappingFile(file)
- *   Parses the uploaded mapping Excel and populates mappingTable.
- *   Expected columns (case-insensitive):
- *     Material Code SORCE / Material Code Source → source code
- *     Material Description (source)              → source desc (informational)
- *     Conversion Factor                          → multiplier
- *     Material Code Target                       → target code
- *     Material Description (target)              → target desc
- *
- * After parsing, calls applyMaterialMapping() and re-renders the current page.
- */
-function loadMappingFile(file) {
-  const statusEl = document.getElementById("mappingFileStatus");
-  statusEl.style.display = "block";
-  statusEl.innerHTML = `<div class="status-ok">⏳ LOADING…</div><div class="status-name">Parsing ${escHtml(file.name)}</div>`;
-
-  const reader = new FileReader();
-  reader.onload = e => {
-    setTimeout(() => {
-      try {
-        const wb   = XLSX.read(new Uint8Array(e.target.result), { type: "array" });
-        const ws   = wb.Sheets[wb.SheetNames[0]];
-        const data = XLSX.utils.sheet_to_json(ws, { defval: "" });
-        if (!data.length) { statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">✗ Mapping file is empty.</div>`; return; }
-
-        // Case-insensitive column lookup
-        const colMap = {};
-        Object.keys(data[0]).forEach(k => { colMap[k.toLowerCase().trim()] = k; });
-        const gc = (...names) => {
-          for (const n of names) {
-            const k = colMap[n.toLowerCase()];
-            if (k) return k;
-          }
-          return null;
-        };
-
-        const colSource  = gc(
-          "material code sorce","material code source","material code (source)",
-          "source material code","source code","mat code source","mat. code source",
-          "source mat code","source material","material source","source"
-        );
-        const colTarget  = gc(
-          "material code target","target material code","target code",
-          "mat code target","mat. code target","target mat code",
-          "target material","material target","target"
-        );
-        const colFactor  = gc(
-          "conversion factor","factor","conv factor","conversion",
-          "conv. factor","uom factor","unit factor","qty factor","quantity factor"
-        );
-        const colTgtDesc = gc(
-          "material description (target)","target description","target desc",
-          "material description target","target material description","desc target",
-          "description (target)","description target"
-        );
-
-        if (!colSource || !colTarget || !colFactor) {
-          const missing = [
-            !colSource && "Material Code Source",
-            !colTarget && "Material Code Target",
-            !colFactor && "Conversion Factor",
-          ].filter(Boolean);
-          const actualCols = Object.keys(data[0]).map(k => k.trim()).join(", ");
-          statusEl.innerHTML = `
-            <div class="status-ok" style="color:var(--red)">✗ Missing required columns: ${missing.join(", ")}</div>
-            <div style="font-size:0.65rem;margin-top:4px;color:var(--muted)">
-              <b>Accepted names:</b><br>
-              • Source: "Material Code Source" (or "Material Code Sorce", "Source Code")<br>
-              • Target: "Material Code Target" (or "Target Material Code", "Target Code")<br>
-              • Factor: "Conversion Factor" (or "Factor", "Conv Factor")<br>
-              <b style="color:var(--amber)">Columns found in your file:</b> ${escHtml(actualCols)}
-            </div>`;
-          return;
-        }
-
-        // Build the mapping table — source → { targetCode, targetDesc, factor }
-        const newMap = new Map();
-        let skipped  = 0;
-        data.forEach(row => {
-          const src    = String(row[colSource]  ?? "").trim();
-          const tgt    = String(row[colTarget]  ?? "").trim();
-          const rawFac = String(row[colFactor]  ?? "").trim();
-          const tDesc  = colTgtDesc ? String(row[colTgtDesc] ?? "").trim() : "";
-          const factor = parseFloat(rawFac);
-
-          if (!src || !tgt || isNaN(factor) || factor <= 0) { skipped++; return; }
-          // Store with 9dp rounding to suppress float drift (consistent with existing reconciliation logic)
-          newMap.set(src.toUpperCase(), { targetCode: tgt, targetDesc: tDesc, factor: parseFloat(factor.toFixed(9)) });
-        });
-
-        if (!newMap.size) {
-          statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">✗ No valid mapping rows found (${skipped} skipped).</div>`;
-          return;
-        }
-
-        mappingTable = newMap;
-
-        // FIX-MAPPING-PERSIST: save mapping to sessionStorage so it survives
-        // soft page navigations within the same browser session.
-        try {
-          const serialized = JSON.stringify([...newMap.entries()]);
-          sessionStorage.setItem("pharmatrack_mapping", serialized);
-        } catch (_) { /* quota exceeded or private mode — silent */ }
-
-        // Apply to current inventory (if loaded)
-        if (rawDf.length) applyMaterialMapping();
-
-        statusEl.innerHTML = `
-          <div class="status-ok">✓ MAPPING LOADED</div>
-          <div class="status-name">${escHtml(file.name)}</div>
-          <div class="status-stats">${newMap.size.toLocaleString()} mapping rules${skipped ? ` · ${skipped} rows skipped` : ""}</div>
-          ${mappingStats ? `<div class="status-stats">${mappingStats.mapped.toLocaleString()} materials mapped · ${mappingStats.valuePct}% of stock value</div>` : ""}`;
-        document.getElementById("mappingUploadBtnText").textContent = "🗺️ Change Mapping File";
-
-        // Re-render current page with mapped data
-        if (rawDf.length) {
-          const reRender = {
-            dashboard: renderDashboard, transit: () => { renderTransit(); renderStockTransitSection(); },
-            expiry: renderExpiry, qc: renderQC, branch: renderBranch, flow: renderFlow,
-            incoming: renderIncomingShelfLife,
-          };
-          if (reRender[currentPage]) reRender[currentPage]();
-        }
-      } catch (err) {
-        statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">✗ ${escHtml(err.message)}</div>`;
-      }
-    }, 30);
-  };
-  reader.readAsArrayBuffer(file);
-}
-
 /**
  * applyMaterialMapping()
  *   Walks rawDf and stamps every row with:
@@ -2874,113 +2546,6 @@ function aggregateByMaterial(df) {
 
   return Object.values(matMap);
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// PAGE SWITCHING
-// ═══════════════════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════════════
-// INCOMING SHELF LIFE — Received Goods File Loader
-// Only HO01 plant, only ZME / ZMS / ZLC valuation types. ZMD excluded.
-// ═══════════════════════════════════════════════════════════════════════════
-function loadIncomingFile(file) {
-  const statusEl = document.getElementById("incomingFileStatus");
-  statusEl.style.display = "block";
-  statusEl.innerHTML = `<div class="status-ok">⏳ LOADING…</div><div class="status-name">Parsing ${escHtml(file.name)}</div>`;
-
-  const reader = new FileReader();
-  reader.onload = e => {
-    setTimeout(() => {
-      try {
-        const wb   = XLSX.read(new Uint8Array(e.target.result), { type: "array", cellDates: true });
-        const ws   = wb.Sheets[wb.SheetNames[0]];
-        const data = XLSX.utils.sheet_to_json(ws, { defval: "" });
-        if (!data.length) { statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">⚠ File empty</div>`; return; }
-
-        const trimmed = data.map(row => {
-          const r = {};
-          for (const [k, v] of Object.entries(row)) r[k.trim()] = v;
-          return r;
-        });
-
-        // Filter: HO01 plant only, ZME/ZMS/ZLC only
-        const ALLOWED_VT = ["ZME","ZMS","ZLC"];
-        let rows = trimmed.filter(r => {
-          const plant = String(r["Plant"] || "").trim().toUpperCase();
-          if (plant !== "HO01") return false;
-          // Extract suffix from Valuation Type (e.g. "51490_ZME" → "ZME")
-          const vt = _islExtractVT(r);
-          return ALLOWED_VT.includes(vt);
-        });
-
-        // Parse fields from received goods file.
-        // ISSUE-1 FIX: Expiry Date comes from inventory (SAP master) during
-        // _islCrossMatchInventory(). Posting Date and Valuation Type are
-        // sourced from this file.
-        rows.forEach(r => {
-          r._postingDate = _islParseDate(r["Posting Date"]);
-          r._vt          = _islExtractVT(r);
-          // SL metrics computed in _islCrossMatchInventory once inventory
-          // expiry dates are resolved; initialise to grey for safety
-          r._slAtReceiptDays = null;
-          r._receiptFlag     = "grey";
-          r._remainingSL     = null;
-          r._ratio           = null;
-          r._flag            = "grey";
-          r._isExpired       = false;
-          r._dataError       = false;
-          // Inventory enrichment fields — populated by _islCrossMatchInventory
-          r._inv_plants   = "—";
-          r._inv_slocs    = "—";
-          r._inv_totalQty = 0;
-          r._inv_expiryDate = null;
-          r._inv_materialGroup = "—";
-          r._inInventory    = null;
-        });
-
-        // Store all parsed HO01/ZME+ZMS+ZLC rows before cross-match
-        incomingRaw = rows;
-        // ISSUE-7 NOTE: .slice() is a shallow copy — the row objects
-        // themselves are shared between incomingRaw and _incomingRawAll.
-        // This is intentional/fine: _islCrossMatchInventory() mutates those
-        // shared objects (_inv_*, _flag, etc.) in place, and _incomingRawAll
-        // is fully reassigned (not appended to) on the next loadIncomingFile()
-        // call, so stale references never leak across file loads.
-        _incomingRawAll = rows.slice(); // preserve full list for re-matching
-
-        // ISL-MATCH: cross-match against inventory — keep only rows whose
-        // Material + Batch combination exists somewhere in rawDf (any branch),
-        // enrich with inventory expiry/plant/qty, compute SL metrics, and
-        // group duplicate receipts by Material+Batch (ISSUE-2).
-        // Always run — even without inventory loaded yet — so grouping is
-        // applied; re-matched again once inventory is uploaded (see
-        // recomputeIslMatch).
-        _islCrossMatchInventory();
-
-        const n = incomingRaw.length;
-        const loadedTotal = rows.length;
-        const matchNote = rawDf.length
-          ? ` · ${n.toLocaleString()} matched in inventory`
-          : ` · Upload inventory to cross-match`;
-        statusEl.innerHTML = `<div class="status-ok">✓ LOADED</div><div class="status-name">${escHtml(file.name)}</div><div class="status-name" style="color:var(--green)">${loadedTotal.toLocaleString()} records (HO01 / ZME+ZMS+ZLC)${matchNote}</div>`;
-        document.getElementById("incomingUploadBtnText").textContent = `📥 ${file.name}`;
-
-        // Populate filters
-        _islPopulateFilters();
-
-        document.getElementById("incoming-no-file").style.display = "none";
-        document.getElementById("incoming-content").style.display = "block";
-
-        // ISSUE-8 FIX: always go through renderPage so currentPage is set
-        // consistently, regardless of which page we're currently on.
-        renderPage("incoming");
-      } catch(err) {
-        statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">⚠ Error: ${escHtml(err.message)}</div>`;
-      }
-    }, 30);
-  };
-  reader.readAsArrayBuffer(file);
-}
-
 // =============================================================================
 // ISL-MATCH: Cross-match received-goods rows against the main inventory.
 //
@@ -4227,3 +3792,576 @@ document.addEventListener("DOMContentLoaded", () => {
     document.getElementById("global-search-results-close").addEventListener("click", hideResultsPanel);
   });
 })();
+// =============================================================================
+// PharmaTrack v2 — upload_fetch_replacement.js
+//
+// DROP-IN REPLACEMENT for the four client-side XLSX parse blocks in script.js.
+//
+// WHAT CHANGED
+// ────────────
+// Before: FileReader → XLSX.read() → sheet_to_json() → in-browser parse/filter
+// After:  FormData → fetch(EDGE_FUNCTION_URL) → JSON response → populate state
+//
+// The Edge Function (upload/index.ts) owns all parsing, filtering, and DB
+// writes.  The browser receives a clean JSON response and fetches the
+// processed rows back from Supabase to populate the same in-memory state
+// (rawDf, stockTransitRaw, incomingRaw, mappingTable) that the rest of
+// script.js already reads.  No other functions in script.js need to change.
+//
+// SETUP (add once, near the top of script.js alongside the other constants)
+// ─────────────────────────────────────────────────────────────────────────
+//   const SUPABASE_URL      = "https://<your-project>.supabase.co";
+//   const SUPABASE_ANON_KEY = "<your-anon-key>";
+//   const EDGE_UPLOAD_URL   = `${SUPABASE_URL}/functions/v1/upload`;
+//
+//   // Supabase JS client — add the CDN tag to index.html BEFORE script.js:
+//   // <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js" defer></script>
+//   const _supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+//
+// AUTH
+// ────
+// The Edge Function rejects unauthenticated callers (HTTP 401).
+// _getAuthHeader() below reads the active session token from the Supabase JS
+// client.  If your app has no login flow yet, use the service-role key only
+// on a secured admin page, or add Supabase Auth (magic link / password).
+//
+// INSTRUCTIONS
+// ────────────
+// 1. Add the SETUP block above to the top of script.js.
+// 2. Replace the four functions listed below inside script.js:
+//      loadFile(file)         → inventory table
+//      loadTransitFile(file)  → transit table
+//      loadIncomingFile(file) → received_goods table
+//      loadMappingFile(file)  → material_mapping table
+//    The event-listener wiring in the DOMContentLoaded block is UNCHANGED —
+//    each listener still calls the same function name with the same File arg.
+// 3. Keep all other functions in script.js exactly as they are.
+// =============================================================================
+
+
+// ── AUTH HELPER ───────────────────────────────────────────────────────────────
+/**
+ * Returns the Authorization header value for the currently signed-in user.
+ * Throws a readable error if no session is found so the caller can surface it.
+ */
+async function _getAuthHeader() {
+  const { data: { session }, error } = await _supabase.auth.getSession();
+  if (error || !session) throw new Error("Not signed in. Please log in before uploading.");
+  return `Bearer ${session.access_token}`;
+}
+
+
+// ── GENERIC UPLOAD HELPER ─────────────────────────────────────────────────────
+/**
+ * _uploadToEdge(file, tableName, notes?)
+ *
+ * Posts `file` to the Edge Function for the given `tableName`.
+ * Returns the parsed JSON response body on success.
+ * Throws an Error with a human-readable message on any failure.
+ *
+ * @param {File}   file      - The File object from the <input type="file">
+ * @param {string} tableName - One of: inventory | transit | received_goods | material_mapping
+ * @param {string} [notes]   - Optional free-text note stored in upload_log
+ * @returns {Promise<{ok:boolean, table:string, rows_inserted:number, rows_skipped:number, file_name:string, uploaded_by:string}>}
+ */
+async function _uploadToEdge(file, tableName, notes = "") {
+  const authHeader = await _getAuthHeader();
+
+  const form = new FormData();
+  form.append("table", tableName);
+  form.append("file",  file);
+  if (notes) form.append("notes", notes);
+
+  const res = await fetch(EDGE_UPLOAD_URL, {
+    method:  "POST",
+    headers: { Authorization: authHeader },
+    body:    form,
+  });
+
+  // Always parse JSON — the Edge Function returns structured errors too
+  let body;
+  try {
+    body = await res.json();
+  } catch {
+    throw new Error(`Upload failed (HTTP ${res.status}): server returned non-JSON response`);
+  }
+
+  if (!res.ok || body.error) {
+    throw new Error(body.error ?? `Upload failed with HTTP ${res.status}`);
+  }
+
+  return body;
+}
+
+
+// ── ROW FETCH HELPERS ─────────────────────────────────────────────────────────
+// After the Edge Function inserts into Postgres, we fetch the rows back via
+// Supabase PostgREST so in-memory state is identical to what the DB holds.
+// This means the browser never parses XLSX at all — the canonical parse lives
+// in the Edge Function (upload/index.ts) only.
+
+/**
+ * _fetchInventoryRows()
+ * Fetches all rows from the `inventory` table and re-shapes them to match the
+ * flat object structure that the rest of script.js expects (same column names
+ * as the original XLSX headers, plus the _expiry / Total Qty / Total Value
+ * derived fields that loadFile() used to compute inline).
+ */
+async function _fetchInventoryRows() {
+  // Select only the columns the UI reads — keeps the payload small.
+  // Extend the select list if you add columns later.
+  const { data, error } = await _supabase
+    .from("inventory")
+    .select(
+      "material, material_description, plant, plant_name, " +
+      "storage_location, storage_location_desc, " +
+      "special_stock_type, special_stock_type_desc, " +
+      "qty_unrestricted, qty_quality_inspection, qty_blocked, qty_transit, " +
+      "batch, valuation_type, material_group, " +
+      "production_date, expiry_date, " +
+      "value_unrestricted, value_quality_inspection, value_transit"
+    );
+
+  if (error) throw new Error(`Could not fetch inventory from DB: ${error.message}`);
+
+  // Re-map DB column names → the original SAP header names that all render
+  // functions in script.js reference (e.g. row["Unrestricted Stock"]).
+  return data.map(r => {
+    const row = {
+      "Material":                          r.material,
+      "Material Description":              r.material_description ?? "",
+      "Plant":                             r.plant,
+      "Plant Name":                        r.plant_name ?? "",
+      "Storage Location":                  r.storage_location ?? "",
+      "Description of Storage Location":   r.storage_location_desc ?? "",
+      "Special Stock Type":                r.special_stock_type ?? "",
+      "Special Stock Type Description":    r.special_stock_type_desc ?? "",
+      "Unrestricted Stock":                r.qty_unrestricted ?? 0,
+      "Stock in Quality Inspection":       r.qty_quality_inspection ?? 0,
+      "Blocked Stock":                     r.qty_blocked ?? 0,
+      "Stock in Transit":                  r.qty_transit ?? 0,
+      "Batch":                             r.batch ?? "",
+      "Inventory Valuation Type":          r.valuation_type ?? "",
+      "Material Group Name":               r.material_group ?? "",
+      "Production Date":                   r.production_date ?? "",
+      "Shelf Life Expiration Date":        r.expiry_date ?? "",
+      "Value of Unrestricted Stock":       r.value_unrestricted ?? 0,
+      "Value of Stock in Quality Inspection": r.value_quality_inspection ?? 0,
+      "Value of Stock in Transit":         r.value_transit ?? 0,
+    };
+
+    // Derived fields — mirrors what the old loadFile() computed inline.
+    row["Total Value"] =
+      row["Value of Unrestricted Stock"] +
+      row["Value of Stock in Transit"] +
+      row["Value of Stock in Quality Inspection"];
+
+    row["Total Qty"] =
+      row["Unrestricted Stock"] +
+      row["Stock in Transit"] +
+      row["Stock in Quality Inspection"];
+
+    // _expiry: timezone-safe JS Date used by expiry / shelf-life render
+    // functions.  parseExpiryDate() already exists in script.js.
+    row._expiry = parseExpiryDate(row["Shelf Life Expiration Date"]);
+
+    return row;
+  });
+}
+
+/**
+ * _fetchTransitRows()
+ * Fetches rows from the `transit` table and maps them to the _st_* prefixed
+ * shape that loadTransitFile() used to produce.
+ */
+async function _fetchTransitRows() {
+  const { data, error } = await _supabase
+    .from("transit")
+    .select(
+      "material, material_description, plant, plant_name, " +
+      "purchasing_document, po_item, supplying_plant, special_stock, " +
+      "quantity, base_unit, order_quantity, order_unit, " +
+      "amount_local, net_order_value, currency"
+    );
+
+  if (error) throw new Error(`Could not fetch transit rows from DB: ${error.message}`);
+
+  return data.map(r => ({
+    "_st_material":     r.material ?? "",
+    "_st_desc":         r.material_description ?? "",
+    "_st_plant":        r.plant ?? "",
+    "_st_plantName":    r.plant_name ?? "",
+    "_st_purDoc":       r.purchasing_document ?? "",
+    "_st_supPlant":     r.supplying_plant ?? "",
+    "_st_qty":          r.quantity ?? 0,
+    "_st_uom":          r.base_unit ?? "",
+    "_st_item":         r.po_item != null ? String(r.po_item) : "",
+    "_st_specialStock": r.special_stock ?? "",
+  }));
+}
+
+/**
+ * _fetchIncomingRows()
+ * Fetches rows from `received_goods` and maps them to the shape that
+ * loadIncomingFile() produced after its HO01 + ZME/ZMS/ZLC filters.
+ *
+ * NOTE: the Edge Function ingests ALL movement-101 rows without plant/VT
+ * filtering (see upload.ts transformReceivedGoodsRow comment).  The HO01
+ * and valuation-type filter is applied here on the client, exactly as
+ * loadIncomingFile() did before, so the filtering logic stays in one place
+ * and can be changed without redeploying the Edge Function.
+ */
+async function _fetchIncomingRows() {
+  const ALLOWED_VT = ["ZME", "ZMS", "ZLC"];
+
+  const { data, error } = await _supabase
+    .from("received_goods")
+    .select("*")
+    .eq("plant", "HO01");    // push the plant filter to the DB to reduce payload
+
+  if (error) throw new Error(`Could not fetch received_goods from DB: ${error.message}`);
+
+  // Re-shape to the flat SAP-header object that _islCrossMatchInventory() reads.
+  const rows = data
+    .filter(r => {
+      // Valuation type suffix check (e.g. "51490_ZME" → "ZME")
+      const vt = _islExtractVT({ "Valuation Type": r.valuation_type ?? "" });
+      return ALLOWED_VT.includes(vt);
+    })
+    .map(r => {
+      const row = {
+        "Material Document":    r.material_document ?? "",
+        "Item":                 r.material_doc_item ?? "",
+        "Entry Date":           r.entry_date ?? "",
+        "Posting Date":         r.posting_date ?? "",
+        "Document Date":        r.document_date ?? "",
+        "Time of Entry":        r.time_of_entry ?? "",
+        "Mvt Type":             r.movement_type ?? "",
+        "Movement Type Text":   r.movement_type_text ?? "",
+        "Movement Indicator":   r.movement_indicator ?? "",
+        "Material":             r.material ?? "",
+        "Material Description": r.material_description ?? "",
+        "Plant":                r.plant ?? "",
+        "Name 1":               r.plant_name ?? "",
+        "Storage Location":     r.storage_location ?? "",
+        "Special Stock":        r.special_stock ?? "",
+        "Qty in unit of entry": r.qty_entry ?? "",
+        "Unit of Entry":        r.unit_of_entry ?? "",
+        "Quantity":             r.qty_base ?? "",
+        "Base Unit of Measure": r.base_unit ?? "",
+        "Batch":                r.batch ?? "",
+        "Valuation Type":       r.valuation_type ?? "",
+        "Amt.in Loc.Cur.":      r.amount_local ?? "",
+        "Purchase Order":       r.purchase_order ?? "",
+        "PO Item":              r.po_item ?? "",
+        "Vendor/Supplying Plant": r.supplier ?? "",
+        "Co. Code":             r.company_code ?? "",
+        "User Name":            r.user_name ?? "",
+        "WBS Element":          r.wbs_element ?? "",
+        "Currency":             r.currency ?? "ETB",
+      };
+
+      // Derive the same helper fields loadIncomingFile() computed inline.
+      row._postingDate      = _islParseDate(row["Posting Date"]);
+      row._vt               = _islExtractVT(row);
+      row._slAtReceiptDays  = null;
+      row._receiptFlag      = "grey";
+      row._remainingSL      = null;
+      row._ratio            = null;
+      row._flag             = "grey";
+      row._isExpired        = false;
+      row._dataError        = false;
+      row._inv_plants       = "—";
+      row._inv_slocs        = "—";
+      row._inv_totalQty     = 0;
+      row._inv_expiryDate   = null;
+      row._inv_materialGroup = "—";
+      row._inInventory      = null;
+
+      return row;
+    });
+
+  return rows;
+}
+
+/**
+ * _fetchMappingRows()
+ * Fetches rows from `material_mapping` and reconstructs the mappingTable Map
+ * and the mappedDf array that applyMaterialMapping() expects to already exist.
+ *
+ * Returns an object { mappingTable: Map, rawMappingRows: Array } so the
+ * caller can set both globals in one go.
+ */
+async function _fetchMappingRows() {
+  const { data, error } = await _supabase
+    .from("material_mapping")
+    .select("source_code, source_description, target_code, target_description, conversion_factor, amc");
+
+  if (error) throw new Error(`Could not fetch material_mapping from DB: ${error.message}`);
+
+  // mappingTable shape: Map<sourceCode → { targetCode, targetDesc, factor, amc }>
+  // This is what applyMaterialMapping() in script.js already reads.
+  const table = new Map();
+  data.forEach(r => {
+    table.set(String(r.source_code).trim(), {
+      targetCode:  String(r.target_code).trim(),
+      targetDesc:  r.target_description ?? "",
+      factor:      r.conversion_factor ?? 1,
+      amc:         r.amc ?? null,
+    });
+  });
+
+  return { mappingTable: table, rawMappingRows: data };
+}
+
+
+// =============================================================================
+// REPLACEMENT UPLOAD FUNCTIONS
+// Replace the originals in script.js with these four.
+// The function signatures and the state they write are identical to the old
+// FileReader/XLSX versions so all downstream code is unaffected.
+// =============================================================================
+
+// ── 1. INVENTORY ─────────────────────────────────────────────────────────────
+/**
+ * loadFile(file)  [REPLACEMENT]
+ *
+ * Sends the inventory XLSX/CSV to the Edge Function, then fetches the
+ * processed rows back from the `inventory` table to populate rawDf / filtDf.
+ */
+async function loadFile(file) {
+  const statusEl = document.getElementById("fileStatus");
+  statusEl.style.display = "block";
+  statusEl.innerHTML = `<div class="status-ok">⏳ UPLOADING…</div><div class="status-name">${escHtml(file.name)}</div>`;
+
+  try {
+    // ── Step 1: ship the raw file to the Edge Function ──────────────────────
+    const result = await _uploadToEdge(file, "inventory");
+
+    // ── Step 2: update status to show parse/insert counts ──────────────────
+    statusEl.innerHTML =
+      `<div class="status-ok">⏳ FETCHING…</div>` +
+      `<div class="status-name">${escHtml(file.name)} ` +
+      `(${result.rows_inserted.toLocaleString()} rows inserted` +
+      `${result.rows_skipped ? `, ${result.rows_skipped} skipped` : ""})</div>`;
+
+    // ── Step 3: fetch the cleaned rows back from Postgres ───────────────────
+    const df = await _fetchInventoryRows();
+
+    if (!df.length) {
+      showError("Upload succeeded but no rows were returned. Check that the file has data.");
+      return;
+    }
+
+    // ── Step 4: populate the same globals loadFile() used to set ───────────
+    rawDf  = df;
+    filtDf = df;
+
+    // Apply material standardization mapping if already loaded
+    if (mappingTable.size > 0) applyMaterialMapping();
+
+    // ISL-MATCH: re-cross-match received goods against new inventory snapshot
+    recomputeIslMatch();
+
+    // Reset stale page filters
+    resetPageFilters();
+    stFilterState = { purDoc: "", supPlant: "" };
+
+    // Stamp phantom flags if transit file already loaded
+    if (stockTransitRaw.length) recomputePhantomTransit();
+
+    showSuccess(file.name, df.length);
+    clearError();
+    hideLanding();
+    populateAllFilters();
+    renderPage(currentPage === "home" ? "dashboard" : currentPage);
+
+  } catch (err) {
+    showError(`Inventory upload failed: ${err.message}`);
+    statusEl.style.display = "none";
+  }
+}
+
+
+// ── 2. STOCK IN TRANSIT ───────────────────────────────────────────────────────
+/**
+ * loadTransitFile(file)  [REPLACEMENT]
+ *
+ * Sends the transit XLSX/CSV to the Edge Function, then fetches processed rows
+ * from `transit` to populate stockTransitRaw.
+ */
+async function loadTransitFile(file) {
+  const statusEl = document.getElementById("transitFileStatus");
+  statusEl.style.display = "block";
+  statusEl.innerHTML = `<div class="status-ok">⏳ UPLOADING…</div><div class="status-name">${escHtml(file.name)}</div>`;
+
+  try {
+    // ── Step 1: ship to Edge Function ───────────────────────────────────────
+    const result = await _uploadToEdge(file, "transit");
+
+    statusEl.innerHTML =
+      `<div class="status-ok">⏳ FETCHING…</div>` +
+      `<div class="status-name">${escHtml(file.name)} ` +
+      `(${result.rows_inserted.toLocaleString()} rows)</div>`;
+
+    // ── Step 2: fetch back ──────────────────────────────────────────────────
+    let df = await _fetchTransitRows();
+
+    // FIX-EXCL-SLOC: keep only materials that exist in rawDf (same guard as
+    // the original loadTransitFile) so excluded materials never appear in the
+    // Transit section even if the DB still holds them from a previous upload.
+    if (rawDf.length) {
+      const allowedMaterials = new Set(rawDf.map(r => String(r["Material"] || "").trim()));
+      df = df.filter(r => allowedMaterials.has(r._st_material));
+    }
+
+    // ── Step 3: populate globals ────────────────────────────────────────────
+    stockTransitRaw = df;
+    stFilterState   = { purDoc: "", supPlant: "" };
+
+    recomputePhantomTransit();
+
+    statusEl.innerHTML =
+      `<div class="status-ok">✓ TRANSIT FILE LOADED</div>` +
+      `<div class="status-name">${escHtml(file.name)} (${df.length.toLocaleString()} records)</div>`;
+    document.getElementById("transitUploadBtnText").textContent = "📦 Change Transit File";
+
+    // Re-render current page so phantom exclusions take effect immediately
+    const reRender = {
+      dashboard: renderDashboard,
+      transit:   () => { renderTransit(); renderStockTransitSection(); },
+      branch:    renderBranch,
+      flow:      renderFlow,
+    };
+    if (reRender[currentPage]) reRender[currentPage]();
+    else if (currentPage === "transit") renderStockTransitSection();
+
+  } catch (err) {
+    statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">✗ ${escHtml(err.message)}</div>`;
+  }
+}
+
+
+// ── 3. INCOMING SHELF LIFE (received_goods) ───────────────────────────────────
+/**
+ * loadIncomingFile(file)  [REPLACEMENT]
+ *
+ * Sends the received-goods XLSX/CSV to the Edge Function, then fetches the
+ * rows back from `received_goods` (filtered HO01 + ZME/ZMS/ZLC client-side)
+ * to populate incomingRaw / _incomingRawAll.
+ */
+async function loadIncomingFile(file) {
+  const statusEl = document.getElementById("incomingFileStatus");
+  statusEl.style.display = "block";
+  statusEl.innerHTML = `<div class="status-ok">⏳ UPLOADING…</div><div class="status-name">${escHtml(file.name)}</div>`;
+
+  try {
+    // ── Step 1: ship to Edge Function ───────────────────────────────────────
+    const result = await _uploadToEdge(file, "received_goods");
+
+    statusEl.innerHTML =
+      `<div class="status-ok">⏳ FETCHING…</div>` +
+      `<div class="status-name">${escHtml(file.name)} ` +
+      `(${result.rows_inserted.toLocaleString()} rows inserted)</div>`;
+
+    // ── Step 2: fetch back (HO01 + VT filter applied in _fetchIncomingRows) ─
+    const rows = await _fetchIncomingRows();
+
+    if (!rows.length) {
+      statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">⚠ No HO01/ZME+ZMS+ZLC rows found after filtering</div>`;
+      return;
+    }
+
+    // ── Step 3: populate globals (identical to old loadIncomingFile) ─────────
+    incomingRaw     = rows;
+    _incomingRawAll = rows.slice();
+
+    _islCrossMatchInventory();
+
+    const n           = incomingRaw.length;
+    const loadedTotal = rows.length;
+    const matchNote   = rawDf.length
+      ? ` · ${n.toLocaleString()} matched in inventory`
+      : ` · Upload inventory to cross-match`;
+
+    statusEl.innerHTML =
+      `<div class="status-ok">✓ LOADED</div>` +
+      `<div class="status-name">${escHtml(file.name)}</div>` +
+      `<div class="status-name" style="color:var(--green)">` +
+      `${loadedTotal.toLocaleString()} records (HO01 / ZME+ZMS+ZLC)${matchNote}</div>`;
+
+    document.getElementById("incomingUploadBtnText").textContent = `📥 ${file.name}`;
+
+    _islPopulateFilters();
+
+    document.getElementById("incoming-no-file").style.display  = "none";
+    document.getElementById("incoming-content").style.display  = "block";
+
+    renderPage("incoming");
+
+  } catch (err) {
+    statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">⚠ Error: ${escHtml(err.message)}</div>`;
+  }
+}
+
+
+// ── 4. MATERIAL STANDARDIZATION MAPPING ──────────────────────────────────────
+/**
+ * loadMappingFile(file)  [REPLACEMENT]
+ *
+ * Sends the mapping XLSX/CSV to the Edge Function, then fetches rows from
+ * `material_mapping` to reconstruct mappingTable and call applyMaterialMapping().
+ *
+ * The elaborate column-name detection logic from the original loadMappingFile
+ * is no longer needed here — the Edge Function handles it (transformMappingRow
+ * in upload.ts already resolves "Material Code SORCE", "Source Code", etc.).
+ * The client just reads the normalised DB columns.
+ */
+async function loadMappingFile(file) {
+  const statusEl = document.getElementById("mappingFileStatus");
+  statusEl.style.display = "block";
+  statusEl.innerHTML = `<div class="status-ok">⏳ UPLOADING…</div><div class="status-name">${escHtml(file.name)}</div>`;
+
+  try {
+    // ── Step 1: ship to Edge Function ───────────────────────────────────────
+    const result = await _uploadToEdge(file, "material_mapping");
+
+    statusEl.innerHTML =
+      `<div class="status-ok">⏳ FETCHING…</div>` +
+      `<div class="status-name">${escHtml(file.name)} ` +
+      `(${result.rows_inserted.toLocaleString()} mapping rules)</div>`;
+
+    // ── Step 2: fetch back ──────────────────────────────────────────────────
+    const { mappingTable: newTable } = await _fetchMappingRows();
+
+    if (!newTable.size) {
+      statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">✗ Mapping file produced no valid rules. Check source/target columns.</div>`;
+      return;
+    }
+
+    // ── Step 3: populate globals ────────────────────────────────────────────
+    mappingTable = newTable;
+
+    // Save to sessionStorage so it survives soft page navigations
+    // (mirrors FIX-MAPPING-PERSIST from the original loadMappingFile)
+    try {
+      const serialized = JSON.stringify([...mappingTable.entries()]);
+      sessionStorage.setItem("pharmatrack_mapping", serialized);
+    } catch (e) { /* quota exceeded — non-fatal */ }
+
+    // Apply mapping and re-render, same as original
+    applyMaterialMapping();
+
+    const { mapped = 0, total = 0, valuePct = "0" } = mappingStats ?? {};
+
+    statusEl.innerHTML =
+      `<div class="status-ok">✓ MAPPING LOADED</div>` +
+      `<div class="status-name">${escHtml(file.name)} (${newTable.size.toLocaleString()} rules)</div>` +
+      `<div class="status-stats">${mapped.toLocaleString()} materials mapped · ${valuePct}% of stock value</div>`;
+
+    renderPage(currentPage);
+
+  } catch (err) {
+    statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">✗ ${escHtml(err.message)}</div>`;
+  }
+}
