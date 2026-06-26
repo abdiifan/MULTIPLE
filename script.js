@@ -1,4 +1,8 @@
 // ── CONSTANTS ──────────────────────────────────────────────────────────────
+const SUPABASE_URL      = "https://sbgnbyflntbyiiwdknhv.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNiZ25ieWZsbnRieWlpd2Rrbmh2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI0Mjc0NjcsImV4cCI6MjA5ODAwMzQ2N30.KBTH2uvY_ZFJhP0TpQ7MqG1Q_AVblxYLHrdyU3f3n2A";
+const EDGE_UPLOAD_URL   = `${SUPABASE_URL}/functions/v1/upload`;
+const _supabase         = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const REQUIRED_COLUMNS = [
   "Material","Material Description","Plant","Plant Name",
   "Storage Location","Description of Storage Location",
